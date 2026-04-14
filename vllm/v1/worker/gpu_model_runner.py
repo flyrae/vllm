@@ -4656,7 +4656,25 @@ class GPUModelRunner(
                 )
 
             num_rejected_tokens_gpu = None
-            if spec_decode_metadata is None:
+            if spec_decode_metadata is None and spec_config.use_dflash():
+                # DFlash TTFT optimisation: when spec_decode_metadata is None
+                # the batch contains no prior speculative tokens – either all
+                # requests are still prefilling or this is their very first
+                # decode step.  Running drafter.propose() here would trigger
+                # precompute_and_store_context_kv(), which processes every
+                # context token (O(N * H * L)) and significantly increases
+                # TTFT.  The work is wasted in any case because the scheduler
+                # discards draft tokens for is_prefill_chunk requests in
+                # update_draft_token_ids().  For the rare mixed batch (a new
+                # decode request joins an otherwise-prefill batch) we skip one
+                # speculation step, but the TTFT saving far outweighs that
+                # minor throughput cost.
+                draft_token_ids = torch.zeros(
+                    (self.input_batch.num_reqs, self.num_spec_tokens),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+            elif spec_decode_metadata is None:
                 token_indices_to_sample = None
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
@@ -4707,26 +4725,27 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
-            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
-                mm_embed_inputs = self._gather_mm_embeddings(
-                    scheduler_output,
-                    shift_computed_tokens=1,
-                )
-            else:
-                mm_embed_inputs = None
+            if not (spec_decode_metadata is None and spec_config.use_dflash()):
+                if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                    mm_embed_inputs = self._gather_mm_embeddings(
+                        scheduler_output,
+                        shift_computed_tokens=1,
+                    )
+                else:
+                    mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
-            )
+                draft_token_ids = self.drafter.propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    sampling_metadata=sampling_metadata,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    slot_mappings=slot_mappings,
+                )
 
         return draft_token_ids
 
